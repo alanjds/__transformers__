@@ -1,7 +1,22 @@
 import ast
 from importlib import import_module
 from importlib.machinery import PathFinder, SourceFileLoader
+import re
 import sys
+
+_TRANSFORMER_IMPORT_RE = re.compile(
+    r'from\s+__transformers__\s+import\s+([\w\s,]+)'
+)
+
+
+def _get_source_transformer_names(source_str):
+    names = []
+    for match in _TRANSFORMER_IMPORT_RE.finditer(source_str):
+        for name in match.group(1).split(','):
+            name = name.strip()
+            if name and name not in ('_loader', 'setup'):
+                names.append(name)
+    return names
 
 
 class NodeVisitor(ast.NodeVisitor):
@@ -44,6 +59,15 @@ class Finder(PathFinder):
 
 class Loader(SourceFileLoader):
     def source_to_code(self, data, path, *, _optimize=-1):
+        source = data.decode('utf-8') if isinstance(data, bytes) else data
+        for name in _get_source_transformer_names(source):
+            try:
+                module = import_module('.{}'.format(name), '__transformers__')
+                if hasattr(module, 'source_preprocessor'):
+                    source = module.source_preprocessor(source)
+            except ImportError:
+                pass
+        data = source.encode('utf-8') if isinstance(data, bytes) else source
         tree = ast.parse(data)
         tree = transform(tree)
         return compile(tree, path, 'exec',
