@@ -1,6 +1,19 @@
 import ast
+import asyncio
+import concurrent.futures
 import io
 import tokenize
+
+
+def _run_coro(coro):
+    """Run a coroutine synchronously, regardless of whether an event loop is already running."""
+    try:
+        asyncio.get_running_loop()
+        # Inside a running loop — execute in a fresh thread with its own loop
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+    except RuntimeError:
+        return asyncio.run(coro)
 
 
 def _replace_await_once(source):
@@ -47,7 +60,7 @@ def source_preprocessor(source):
 class AwaitSyncTransformer(ast.NodeTransformer):
     def __init__(self):
         self._in_async = False
-        self._needs_asyncio = False
+        self._needs_runner = False
 
     def _is_await_sync_call(self, node):
         return (isinstance(node, ast.Call) and
@@ -58,10 +71,14 @@ class AwaitSyncTransformer(ast.NodeTransformer):
 
     def visit_Module(self, node):
         self._in_async = False
-        self._needs_asyncio = False
+        self._needs_runner = False
         self.generic_visit(node)
-        if self._needs_asyncio:
-            import_node = ast.Import(names=[ast.alias(name='asyncio', asname=None)])
+        if self._needs_runner:
+            import_node = ast.ImportFrom(
+                module='__transformers__.await_sync',
+                names=[ast.alias(name='_run_coro', asname='__await_sync_run__')],
+                level=0,
+            )
             ast.fix_missing_locations(import_node)
             node.body.insert(0, import_node)
         return node
@@ -88,13 +105,12 @@ class AwaitSyncTransformer(ast.NodeTransformer):
         if self._in_async:
             new_node = ast.Await(value=expr)
         else:
-            self._needs_asyncio = True
-            asyncio_run = ast.Attribute(
-                value=ast.Name(id='asyncio', ctx=ast.Load()),
-                attr='run',
-                ctx=ast.Load(),
+            self._needs_runner = True
+            new_node = ast.Call(
+                func=ast.Name(id='__await_sync_run__', ctx=ast.Load()),
+                args=[expr],
+                keywords=[],
             )
-            new_node = ast.Call(func=asyncio_run, args=[expr], keywords=[])
         return ast.fix_missing_locations(new_node)
 
 

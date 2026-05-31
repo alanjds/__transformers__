@@ -60,35 +60,30 @@ class TestSourcePreprocessor:
 
 
 class TestAwaitSyncTransformer:
-    def test_sync_function_uses_asyncio_run(self):
+    def test_sync_function_runs_coroutine(self):
         async def coro():
             return 42
 
-        ns = _exec('def f():\n    return await coro()\n')
-        ns['coro'] = coro
-        # Re-execute with coro in scope
         tree = _transform('def f():\n    return await coro()\n')
         bytecode = compile(tree, '<string>', 'exec')
-        ns2 = {'coro': coro}
-        exec(bytecode, ns2)
-        assert ns2['f']() == 42
+        ns = {'coro': coro}
+        exec(bytecode, ns)
+        assert ns['f']() == 42
 
-    def test_import_asyncio_injected(self):
+    def test_runner_import_injected(self):
         tree = _transform('def f():\n    return await coro()\n')
         first_node = tree.body[0]
-        assert isinstance(first_node, ast.Import)
-        assert first_node.names[0].name == 'asyncio'
+        assert isinstance(first_node, ast.ImportFrom)
+        assert first_node.module == '__transformers__.await_sync'
+        assert first_node.names[0].name == '_run_coro'
+        assert first_node.names[0].asname == '__await_sync_run__'
 
     def test_no_import_injected_when_no_sync_await(self):
         code = 'async def f():\n    return await coro()\n'
         source = source_preprocessor(code)
         tree = ast.parse(source)
         tree = transformer.visit(tree)
-        assert not any(
-            isinstance(n, ast.Import) and
-            any(alias.name == 'asyncio' for alias in n.names)
-            for n in tree.body
-        )
+        assert not any(isinstance(n, (ast.Import, ast.ImportFrom)) for n in tree.body)
 
     def test_async_function_keeps_real_await(self):
         code = 'async def f():\n    return await coro()\n'
@@ -99,15 +94,15 @@ class TestAwaitSyncTransformer:
         ret = func_body[0]
         assert isinstance(ret.value, ast.Await)
 
-    def test_sync_function_produces_asyncio_run_call(self):
+    def test_sync_function_produces_runner_call(self):
         code = 'def f():\n    return await coro()\n'
         tree = _transform(code)
         # The function body is after the injected import
         func_def = tree.body[1]
         ret = func_def.body[0]
         assert isinstance(ret.value, ast.Call)
-        assert isinstance(ret.value.func, ast.Attribute)
-        assert ret.value.func.attr == 'run'
+        assert isinstance(ret.value.func, ast.Name)
+        assert ret.value.func.id == '__await_sync_run__'
 
     def test_end_to_end_sync_calls_coroutine(self):
         async def add(a, b):
@@ -134,9 +129,6 @@ class TestAwaitSyncTransformer:
         assert asyncio.run(ns['f']()) == 10
 
     def test_nested_sync_inside_async_transforms_correctly(self):
-        # A sync function nested inside an async function gets asyncio.run();
-        # at runtime this would raise RuntimeError if called while an event loop
-        # is already running — that's a known asyncio limitation, not a bug here.
         code = (
             'async def outer():\n'
             '    def inner():\n'
@@ -144,12 +136,25 @@ class TestAwaitSyncTransformer:
             '    return inner()\n'
         )
         tree = _transform(code)
-        # inner() is a FunctionDef so its await should become asyncio.run()
         async_func = tree.body[1]   # async def outer (after injected import)
         inner_func = async_func.body[0]  # def inner
         assert isinstance(inner_func, ast.FunctionDef)
         ret = inner_func.body[0]
-        # return asyncio.run(fetch())
         assert isinstance(ret.value, ast.Call)
-        assert isinstance(ret.value.func, ast.Attribute)
-        assert ret.value.func.attr == 'run'
+        assert isinstance(ret.value.func, ast.Name)
+        assert ret.value.func.id == '__await_sync_run__'
+
+    def test_works_when_called_from_running_loop(self):
+        async def fetch():
+            return 7
+
+        code = 'def sync_helper():\n    return await fetch()\n'
+        tree = _transform(code)
+        bytecode = compile(tree, '<string>', 'exec')
+        ns = {'fetch': fetch}
+        exec(bytecode, ns)
+
+        async def driver():
+            return ns['sync_helper']()  # sync — no await
+
+        assert asyncio.run(driver()) == 7
