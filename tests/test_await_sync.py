@@ -52,6 +52,32 @@ class TestSourcePreprocessor:
         assert not _has_bare_await(result)
         assert result.count('__await_sync__') == 2
 
+    def test_await_in_async_def_not_replaced(self):
+        source = 'async def f():\n    x = await coro()\n'
+        result = source_preprocessor(source)
+        assert '__await_sync__' not in result
+
+    def test_sync_def_nested_in_async_def_is_replaced(self):
+        source = (
+            'async def outer():\n'
+            '    def inner():\n'
+            '        return await coro()\n'
+        )
+        result = source_preprocessor(source)
+        assert '__await_sync__' in result
+        assert not _has_bare_await(result)
+
+    def test_async_for_does_not_confuse_context(self):
+        # 'async for' must not push to func_stack (it's not a def)
+        source = (
+            'async def f():\n'
+            '    async for x in gen():\n'
+            '        pass\n'
+            '    x = await coro()\n'
+        )
+        result = source_preprocessor(source)
+        assert '__await_sync__' not in result
+
     def test_idempotent(self):
         source = 'def f():\n    x = await coro()\n'
         once = source_preprocessor(source)
@@ -85,14 +111,16 @@ class TestAwaitSyncTransformer:
         tree = transformer.visit(tree)
         assert not any(isinstance(n, (ast.Import, ast.ImportFrom)) for n in tree.body)
 
-    def test_async_function_keeps_real_await(self):
+    def test_async_function_await_not_replaced_by_preprocessor(self):
+        # Context-aware tokenizer must leave await inside async def untouched
         code = 'async def f():\n    return await coro()\n'
-        source = source_preprocessor(code)
-        tree = ast.parse(source)
-        tree = transformer.visit(tree)
-        func_body = tree.body[-1].body
-        ret = func_body[0]
-        assert isinstance(ret.value, ast.Await)
+        result = source_preprocessor(code)
+        assert '__await_sync__' not in result
+        assert not _has_bare_await(result) is False  # await still present
+        # Parses as valid async Python — real await node survives
+        tree = ast.parse(result)
+        func_body = tree.body[0].body
+        assert isinstance(func_body[0].value, ast.Await)
 
     def test_sync_function_produces_runner_call(self):
         code = 'def f():\n    return await coro()\n'

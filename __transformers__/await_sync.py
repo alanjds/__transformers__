@@ -19,32 +19,62 @@ def _run_coro(coro):
 def _replace_await_once(source):
     tokens_in = tokenize.generate_tokens(io.StringIO(source).readline)
     out = []
+    indent_level = 0
+    func_stack = []     # (level_where_def_appeared, is_async)
+    prev_was_async = False
+
     for tok in tokens_in:
-        if tok.type == tokenize.NAME and tok.string == 'await':
-            out.append((tokenize.NAME, '__await_sync__'))
-            out.append((tokenize.OP, '('))
-            depth = 0
-            for inner in tokens_in:
-                if inner.type in (tokenize.NEWLINE, tokenize.ENDMARKER) and depth == 0:
-                    out.append((tokenize.OP, ')'))
-                    out.append((inner.type, inner.string))
-                    break
-                elif inner.type == tokenize.OP and inner.string in ('(', '[', '{'):
-                    depth += 1
-                    out.append((inner.type, inner.string))
-                elif inner.type == tokenize.OP and inner.string in (')', ']', '}'):
-                    depth -= 1
-                    out.append((inner.type, inner.string))
-                    if depth < 0:
+        if tok.type == tokenize.INDENT:
+            indent_level += 1
+            out.append((tok.type, tok.string))
+            prev_was_async = False
+
+        elif tok.type == tokenize.DEDENT:
+            indent_level -= 1
+            while func_stack and func_stack[-1][0] >= indent_level:
+                func_stack.pop()
+            out.append((tok.type, tok.string))
+            prev_was_async = False
+
+        elif tok.type == tokenize.NAME and tok.string == 'async':
+            prev_was_async = True
+            out.append((tok.type, tok.string))
+
+        elif tok.type == tokenize.NAME and tok.string == 'def':
+            func_stack.append((indent_level, prev_was_async))
+            out.append((tok.type, tok.string))
+            prev_was_async = False
+
+        elif tok.type == tokenize.NAME and tok.string == 'await':
+            in_sync_def = func_stack and not func_stack[-1][1]
+            if in_sync_def:
+                out.append((tokenize.NAME, '__await_sync__'))
+                out.append((tokenize.OP, '('))
+                depth = 0
+                for inner in tokens_in:
+                    if inner.type in (tokenize.NEWLINE, tokenize.ENDMARKER) and depth == 0:
                         out.append((tokenize.OP, ')'))
+                        out.append((inner.type, inner.string))
                         break
-                    elif depth == 0:
-                        out.append((tokenize.OP, ')'))
-                        break
-                else:
-                    out.append((inner.type, inner.string))
+                    elif inner.type == tokenize.OP and inner.string in ('(', '[', '{'):
+                        depth += 1
+                        out.append((inner.type, inner.string))
+                    elif inner.type == tokenize.OP and inner.string in (')', ']', '}'):
+                        depth -= 1
+                        out.append((inner.type, inner.string))
+                        if depth < 0 or depth == 0:
+                            out.append((tokenize.OP, ')'))
+                            break
+                    else:
+                        out.append((inner.type, inner.string))
+            else:
+                out.append((tok.type, tok.string))
+            prev_was_async = False
+
         else:
             out.append((tok.type, tok.string))
+            prev_was_async = False
+
     return tokenize.untokenize(out)
 
 
@@ -59,7 +89,6 @@ def source_preprocessor(source):
 
 class AwaitSyncTransformer(ast.NodeTransformer):
     def __init__(self):
-        self._in_async = False
         self._needs_runner = False
 
     def _is_await_sync_call(self, node):
@@ -70,7 +99,6 @@ class AwaitSyncTransformer(ast.NodeTransformer):
                 not node.keywords)
 
     def visit_Module(self, node):
-        self._in_async = False
         self._needs_runner = False
         self.generic_visit(node)
         if self._needs_runner:
@@ -83,35 +111,16 @@ class AwaitSyncTransformer(ast.NodeTransformer):
             node.body.insert(0, import_node)
         return node
 
-    def visit_AsyncFunctionDef(self, node):
-        prev = self._in_async
-        self._in_async = True
-        self.generic_visit(node)
-        self._in_async = prev
-        return node
-
-    def visit_FunctionDef(self, node):
-        prev = self._in_async
-        self._in_async = False
-        self.generic_visit(node)
-        self._in_async = prev
-        return node
-
     def visit_Call(self, node):
         self.generic_visit(node)
         if not self._is_await_sync_call(node):
             return node
-        expr = node.args[0]
-        if self._in_async:
-            new_node = ast.Await(value=expr)
-        else:
-            self._needs_runner = True
-            new_node = ast.Call(
-                func=ast.Name(id='__await_sync_run__', ctx=ast.Load()),
-                args=[expr],
-                keywords=[],
-            )
-        return ast.fix_missing_locations(new_node)
+        self._needs_runner = True
+        return ast.fix_missing_locations(ast.Call(
+            func=ast.Name(id='__await_sync_run__', ctx=ast.Load()),
+            args=node.args,
+            keywords=[],
+        ))
 
 
 transformer = AwaitSyncTransformer()
